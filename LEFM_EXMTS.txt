@@ -1,0 +1,766 @@
+##################################################################
+#
+# Contact model and fretting fatigue cycle - Stress analysis
+# CanWang
+###################################################################
+#
+#IMPORT MODULES
+#
+import os# Change the directory
+from abaqus import *
+from abaqusConstants import *
+import odbAccess
+import sys
+import caeModules
+import math
+import section
+import regionToolset
+import displayGroupMdbToolset as dgm
+import part
+import material
+import assembly
+import step
+import interaction
+import load
+import mesh
+import optimization
+import job
+import visualization
+import xyPlot
+import displayGroupOdbToolset as dgo
+import connectorBehavior
+import sketch
+import numpy as np
+##---------------DEFINE PARAMETERS----------------------------------------------------------------------------------------------------------------------------------------------------
+##Geometry
+Spe_L = 40.0 	 											# Specimen length in mm
+Spe_h = 5.0													# Specimen hight in mm
+Pad_R = 50.0												# Pad Radius in mm
+Pad_w = 10.0												# Pad width in mm
+Pad_h = 10.0												# Pad height in mm
+SheetSize = 100.0											# Sketch sheet size
+t = 4.0         											# Pad and Specimen thickness in mm
+
+##Material properties							
+E = 72100.0       											# Young's Modulus in MPa
+nu = 0.33													# Poisson's ratio
+
+##Contact definitions						
+COF = #coefficient of friction between two contact surface (Pad and specimen)													# Coefficient of friction between pad and specimen
+CrackFric = #coefficient between crack surfaces												# Coefficient of friction between crack faces
+PenaltyStiffness = 1.0e-4									# Penalty stiffness used for contact between crack faces
+
+##Mesh details						
+el_size = # Minimum element size at contact interface [in mm]
+dl = # Minimum element size at crack tip [in mm]
+
+##Loading						
+P = #Pressure												# Normal load in N
+Saxial_max = #axial stress											# Max Axial loading in MPa
+Saxial_min = #axial stress										# Min Axial loading in MPa				 
+Saxial = [Saxial_max, Saxial_min]
+Q = 155.165													# Reaction load in the spring (tangential load Q)
+Sreaction_max = Saxial_max - (Q/(Spe_h*t))
+Sreaction_min = Saxial_min + (Q/(Spe_h*t))
+Sreaction_mean = (Sreaction_max + Sreaction_min)/2.0 
+Sreaction = [Sreaction_max, Sreaction_min]					# Reaction stresses in MPa
+Qpressure = [ (-Q/(Pad_h*t)), (Q/(Pad_h*t))]
+
+##Crack Details
+#Initial crack dimensions
+E2 = (((1.0-(nu**2))/E)+((1.0-(nu**2))/E))**(-1.0)
+Dis = 1.45*2.0*sqrt(Pad_R*P/(pi*E2)) 						# Partition distance based on estimate of contact widh (Hertzian theory)
+a0=                                  					# Initial crack length mm
+Theta0 =                           					# Initial crack angle from X direction (positive: counterclockwise)
+X0=                                			# Initial crack position in X direction
+Y0 = 	                      			          		# Initial crack position in Y direction
+#Partitions for inserting crack
+Radius_1 = 0.016 											#Radius of circular partition at crack tip
+#Propagation
+a_incr =                                 			    # Crack length increment mm
+#Parameters for integral
+ContNumber = 												#Number of contours for domain integral calculation
+Contours = 									#Contours used for average of domain integral calculation
+kapa = 3.0 - 4.0*nu											#Material property used to calculate interaction integral adjustment
+dx=1e-6														#Delta x used for numerical derivative (calculate interaction integral adjustment)
+#paris Equation	
+C_paris = 
+m_paris = 
+Kcrit = 
+#---------------------------------------------------------------------------------
+#=== Changing working directory ===
+#---------------------------------------------------------------------------------
+os.chdir(r'#######')
+pathODB = '#####'
+
+# === Writing output data in a external text file===  
+PropAngleFile=open('Propagation.txt','a')
+PropAngleFile.write( 'increment, crack tip Xc, crack tip Yc, Theta_P, Horizontal Angle \n')
+PropAngleFile.close()
+
+MyList = [(X0, Y0)]
+for incr in range(0,40,1):
+	#--------------------MODEL GEOMETRY------------------------------------------------------------------------------------------------------------------------------------------------------
+	if incr==0:
+		HorizontalAngle = Theta0*pi/180.0
+		Xc = X0 + a0*cos(HorizontalAngle)    # Initial Crack tip location X 
+		Yc = Y0 + a0*sin(HorizontalAngle)    # Initial Crack tip location Y
+		Yf = Dis
+	elif incr <= 20:
+		Xc += a_incr*cos(HorizontalAngle)
+		Yc += a_incr*sin(HorizontalAngle)
+		Yf = - Yc + 3.0*a0
+	else:
+		a_incr = 5.0*a0
+		Xc += a_incr*cos(HorizontalAngle)
+		Yc += a_incr*sin(HorizontalAngle)
+		Yf = - Yc + 3.0*a0
+	
+	
+	if Yf >= Spe_h: break
+	if Yf >= Spe_h*0.8: Yf = Spe_h
+	Yfp = 1.5 * Yf
+	#create abaqus model
+	ModelName = 'FF1_'+str(incr)
+	jobName= 'FF1_'+str(incr)
+	FFModel = mdb.Model(name=ModelName, modelType=STANDARD_EXPLICIT)	
+	#create cylindrical pad (scketch and part)
+	y_pad = Pad_R - ((Pad_R)**2 - (Pad_w/2.0)**2)**(0.5)
+	Pad_Sketch = FFModel.ConstrainedSketch(name='Pad_Sketch', sheetSize=SheetSize)
+	Pad_Sketch.Arc3Points( point1=(Pad_w/2.0, y_pad),point2=(-Pad_w/2.0, y_pad),point3=(0.0, 0.0))
+	Pad_Sketch.Line(point1=(Pad_w/2.0, y_pad), point2=(Pad_w/2, y_pad + Pad_h))
+	Pad_Sketch.Line(point1=(Pad_w/2.0, y_pad + Pad_h), point2=(-Pad_w/2.0, y_pad + Pad_h))
+	Pad_Sketch.Line(point1=(-Pad_w/2.0, y_pad + Pad_h), point2=(-Pad_w/2.0, y_pad))
+	Pad = FFModel.Part(dimensionality=TWO_D_PLANAR, name='Pad',type=DEFORMABLE_BODY)
+	Pad.BaseShell(sketch=FFModel.sketches['Pad_Sketch'])
+	
+	#create specimen (scketch and part)
+	Spe_Sketch = FFModel.ConstrainedSketch(name='Specimen_Sketch', sheetSize=SheetSize)
+	Spe_Sketch.Line(point1=(Spe_L/2.0, -Spe_h), point2=(Spe_L/2.0, 0))
+	Spe_Sketch.Line(point1=(Spe_L/2.0, 0), point2=(-Spe_L/2.0, 0))
+	Spe_Sketch.Line(point1=(-Spe_L/2.0, 0), point2=(-Spe_L/2.0, -Spe_h))
+	Spe_Sketch.Line(point1=(-Spe_L/2.0, -Spe_h), point2=(Spe_L/2.0, -Spe_h))
+	Spe = FFModel.Part(dimensionality=TWO_D_PLANAR, name='Specimen',type=DEFORMABLE_BODY)
+	Spe.BaseShell(sketch=FFModel.sketches['Specimen_Sketch'])
+
+	# Crack coordinates
+	MyList.append((Xc, Yc))
+	MyListCoord=tuple(MyList)
+
+	
+	#----------------MATERIAL -------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+	#Define material properties: Elastic material with Young's modulus "E" and Poisson's ratio "nu"
+	Mat = 'MaterialProp' 
+	FFModel.Material(name=Mat)
+	FFModel.materials[Mat].Elastic(table=((E, nu), ))
+	
+	#----------------SECTION  ------------------------------------------------------------------------------------------------------------------------------------------------------------------	
+	#Define section and assign material properties to the section (Choose plane strain conditions)
+	Sec_name = 'Section'
+	FFModel.HomogeneousSolidSection(material=Mat, name=Sec_name, thickness=1.0)
+	
+	# Pad - Assign section 'Section' to the part Pad
+	FPad = Pad.Set(faces=Pad.faces[:], name='Pad_faces')
+	Pad.SectionAssignment(region=Pad.sets['Pad_faces'], sectionName=Sec_name)
+	
+	# Specimen - Assign section 'Section' to the part Specimen
+	FaceSpe = Spe.Set(faces=Spe.faces[:], name='Spe_faces')
+	Spe.SectionAssignment(region=Spe.sets['Spe_faces'], sectionName=Sec_name)
+	
+
+	#-------------------------------------- PARTITION ------------------------------------------------------------------------------------------------------------------------------			
+	#Create Specimen partition for mesh refinement at contact region
+	myPartitionSketch = FFModel.ConstrainedSketch(name='PartitionSpec', sheetSize=SheetSize)
+	myPartitionSketch.Line(point1=(-1.50 * Dis, 0.0), point2=(-1.50 * Dis, -Yfp))
+	myPartitionSketch.Line(point1=(-1.50 * Dis, -Yfp), point2=(1.50 * Dis, -Yfp))
+	myPartitionSketch.Line(point1=(1.50 * Dis, 0.0), point2=(1.50 * Dis, -Yfp))
+	Face = Spe.faces.findAt(((-1.50 * Dis/2.0, -Yfp/2.0, 0.0), ))
+	Spe.PartitionFaceBySketch(faces=Face, sketch=myPartitionSketch)
+
+	#Create Specimen partition (crack seam)
+	myPartitionSketch2 = FFModel.ConstrainedSketch(name='PartitionSpec2', sheetSize=SheetSize)
+	for s in range(0,len(MyListCoord)-1,1):
+		myPartitionSketch2.Line(point1=MyListCoord[s], point2=MyListCoord[s+1])	
+	myPartitionSketch2.CircleByCenterPerimeter(center=(Xc,Yc), point1=((Xc - Radius_1*cos(HorizontalAngle), Yc - Radius_1*sin(HorizontalAngle))))
+	#myPartitionSketch2.CircleByCenterPerimeter(center=(Xc,Yc), point1=((Xc - Radius_1*0.3*cos(HorizontalAngle), Yc - Radius_1*0.3*sin(HorizontalAngle))))
+	Face2 = Spe.faces.findAt(((0.0, -Yfp/2.0, 0.0), ))
+	Spe.PartitionFaceBySketch(faces=Face2, sketch=myPartitionSketch2)
+	
+	#create Pad partition for mesh refinement at contact region
+	myPartitionSketch3 = FFModel.ConstrainedSketch(name='PartitionPad',	sheetSize=SheetSize)
+	y = Pad_R - ((Pad_R)**2 - (1.50 * Dis)**2)**(0.5)
+	myPartitionSketch3.Line(point1=(-1.50 * Dis, y), point2=(-1.50 * Dis, y+1.50 * Dis/2.0))
+	myPartitionSketch3.Line(point1=(-1.50 * Dis, y+1.50 * Dis/2.0), point2=(1.50 * Dis, y+1.50 * Dis/2.0))
+	myPartitionSketch3.Line(point1=(1.50 * Dis, y), point2=(1.50 * Dis, y+1.50 * Dis/2.0))
+	FacePad = Pad.faces.findAt(( (0.0, +1.50 * Dis/2.0, 0.0), ))
+	Pad.PartitionFaceBySketch(faces=FacePad, sketch=myPartitionSketch3)
+	
+	#---------------ASSEMBLY-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+	#create assembly for analysis (position pad at top of specimen). At begining only one point in contact.
+	FFModel.rootAssembly.DatumCsysByDefault(CARTESIAN)
+	FFModel.rootAssembly.Instance(name='Specimen', part=Spe, dependent=ON)
+	FFModel.rootAssembly.Instance(name='Pad', part=Pad, dependent=ON)
+	FFModel.rootAssembly.makeIndependent(instances=(FFModel.rootAssembly.instances['Specimen'], ))
+
+	#--------------INSERT CONVENTIONAL FEM CRACK-----------------------------------------------------------------------------------------------------------------------------------
+	# Crack - create set to define crack
+	edge_crack=[]
+	edges_temp0in = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((Xc - 0.9*Radius_1*cos(HorizontalAngle), Yc - 0.9*Radius_1*sin(HorizontalAngle), 0.0), ))
+	edge_crack.append(edges_temp0in)
+	edges_temp0out = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((Xc - 1.1*Radius_1*cos(HorizontalAngle), Yc - 1.1*Radius_1*sin(HorizontalAngle), 0.0), ))
+	edge_crack.append(edges_temp0out)	
+	if incr!=0: 
+		for t in range(0,(len(MyListCoord)-1),1):
+			edges_temp = FFModel.rootAssembly.instances['Specimen'].edges.findAt((((MyListCoord[t][0]+MyListCoord[t+1][0])/2.0, (MyListCoord[t][1]+MyListCoord[t+1][1])/2.0, 0.0), ))
+			edge_crack.append(edges_temp)
+	CrackSet = FFModel.rootAssembly.Set(edges=edge_crack, name='CrackEdges')
+	FFModel.rootAssembly.engineeringFeatures.assignSeam(regions=CrackSet)
+	
+	# define crack
+	vertice_TIP = FFModel.rootAssembly.instances['Specimen'].vertices.findAt(((Xc, Yc, 0.0), ))
+	crackTip = regionToolset.Region(vertices=vertice_TIP)
+
+	CrackTip_set = FFModel.rootAssembly.Set(vertices=vertice_TIP, name='CrackTipSet')
+	crackFront = crackTip = CrackTip_set
+
+	FFModel.rootAssembly.engineeringFeatures.ContourIntegral(name='Crack-1', symmetric=OFF, 
+		crackFront=crackFront, crackTip=crackTip, extensionDirectionMethod=Q_VECTORS, qVectors=(((MyList[-2][0], MyList[-2][1], 0.0), 
+		(MyList[-1][0], MyList[-1][1], 0.0)), ), midNodePosition=0.25, collapsedElementAtTip=SINGLE_NODE)
+	
+	
+	#------------------------------- MESH-------------------------------------------------------------------------------------------------------------------------------------
+	#Select element type: CPE4R (plane strain, linear element, quadrilateral, reduced integration)
+	elemType1 = mesh.ElemType(elemCode=CPE4R, elemLibrary=STANDARD)
+	elemType2 = mesh.ElemType(elemCode=CPE4R, elemLibrary=STANDARD)	
+	faces = FFModel.rootAssembly.instances['Specimen'].faces
+	pickedRegions =(faces, )
+	FFModel.rootAssembly.setElementType(regions=pickedRegions, elemTypes=(elemType1, ))
+	faces1 = FFModel.rootAssembly.instances['Specimen'].faces.findAt(((Xc + 0.9*Radius_1*cos(HorizontalAngle), Yc + 0.9*Radius_1*sin(HorizontalAngle), 0.0), ))
+	pickedRegions =(faces1, )
+	FFModel.rootAssembly.setElementType(regions=pickedRegions, elemTypes=(elemType1, elemType2))
+	all_faces = FFModel.rootAssembly.instances['Specimen'].faces
+	FFModel.rootAssembly.setMeshControls(elemShape=QUAD, regions=all_faces, technique=FREE)
+	EdgeCrack_insideCircle = FFModel.rootAssembly.instances['Specimen'].faces.findAt(((Xc - 0.9*Radius_1*cos(HorizontalAngle), Yc - 0.9*Radius_1*sin(HorizontalAngle), 0.0), ))#, 
+	#	((Xc - 0.9*0.3*Radius_1*cos(HorizontalAngle), Yc - 0.9*0.3*Radius_1*sin(HorizontalAngle), 0.0), ))
+	FFModel.rootAssembly.setMeshControls(regions=EdgeCrack_insideCircle,elemShape=QUAD_DOMINATED, technique=SWEEP)
+
+	
+	#Specimen mesh sizes - Seeding edges (define element size at edges  and at internal partition of specimen)
+	ContEdge = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((0.0, 0.0, 0.0), (1.05*MyList[0][0], 0.0, 0.0), ))
+	FFModel.rootAssembly.seedEdgeBySize(edges=ContEdge, size=el_size, constraint=FINER)
+	BotEdge = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((0.0, -Spe_h, 0.0), ))
+	FFModel.rootAssembly.seedEdgeBySize(edges=BotEdge, size=0.75, constraint=FINER)
+	LEdge = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((-Spe_L/2.0, -Spe_h/2.0, 0.0), ))
+	FFModel.rootAssembly.seedEdgeBySize(edges=LEdge, size=0.75, constraint=FINER)
+	REdge = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((Spe_L/2.0, -Spe_h/2.0, 0.0), ))
+	FFModel.rootAssembly.seedEdgeBySize(edges=REdge, size=0.75, constraint=FINER)
+	LLEdges = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((0.90*(-Spe_L/2.0), 0.0, 0.0), ))
+	FFModel.rootAssembly.seedEdgeByBias(biasMethod=SINGLE, end1Edges=LLEdges, minSize=4.0*el_size, maxSize=0.75)
+	RLEdges = FFModel.rootAssembly.instances['Specimen'].edges.findAt((( 0.90*(Spe_L/2.0), 0.0, 0.0), ))
+	FFModel.rootAssembly.seedEdgeByBias(biasMethod=SINGLE, end2Edges=RLEdges, minSize=4.0*el_size, maxSize=0.75)
+	Part1Ed = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((-1.50 * Dis, -Yfp/4.0, 0.0), ))
+	Part2Ed = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((1.50 * Dis, -Yfp/4.0, 0.0), ))
+	FFModel.rootAssembly.seedEdgeByBias(biasMethod=SINGLE, end1Edges=Part1Ed, end2Edges=Part2Ed, minSize=el_size, maxSize=10.0 * el_size)
+	Part8Ed = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((X0, -Yfp, 0.0), ))
+	FFModel.rootAssembly.seedEdgeBySize(edges=Part8Ed, size=10.0*el_size, constraint=FINER)
+	
+	#Specimen mesh sizes - Seeding edges (define element size at crack)
+	Crack_EdgeInside = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((Xc - 0.9*Radius_1*cos(HorizontalAngle), Yc - 0.9*Radius_1*sin(HorizontalAngle), 0.0), ))
+	FFModel.rootAssembly.seedEdgeByBias(biasMethod=SINGLE, end2Edges=Crack_EdgeInside, minSize=dl/5.0, maxSize=1.5*dl) 
+	Crack_EdgeOutside = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((Xc - 1.1*Radius_1*cos(HorizontalAngle), Yc - 1.1*Radius_1*sin(HorizontalAngle), 0.0), ))
+	FFModel.rootAssembly.seedEdgeByBias(biasMethod=SINGLE, end2Edges=Crack_EdgeOutside, minSize=dl, maxSize=el_size)
+	
+	if incr==1: 
+		edges_seed_neartip = FFModel.rootAssembly.instances['Specimen'].edges.findAt((((MyListCoord[-2][0]+MyListCoord[-1][0])/2.0, (MyListCoord[-2][1]+MyListCoord[-1][1])/2.0, 0.0), ))
+		FFModel.rootAssembly.seedEdgeByBias(biasMethod=SINGLE, end2Edges=edges_seed_neartip, minSize=1.5*dl, maxSize=el_size) 
+	if incr>=2: 
+		edges_seed_neartip = FFModel.rootAssembly.instances['Specimen'].edges.findAt((((MyListCoord[-3][0]+MyListCoord[-2][0])/2.0, (MyListCoord[-3][1]+MyListCoord[-2][1])/2.0, 0.0), ))
+		FFModel.rootAssembly.seedEdgeByBias(biasMethod=SINGLE, end2Edges=edges_seed_neartip, minSize=el_size, maxSize=dl*15.0) 	
+		edges_seed_neartip = FFModel.rootAssembly.instances['Specimen'].edges.findAt((((MyListCoord[-2][0]+MyListCoord[-1][0])/2.0, (MyListCoord[-2][1]+MyListCoord[-1][1])/2.0, 0.0), ))
+		FFModel.rootAssembly.seedEdgeByBias(biasMethod=SINGLE, end2Edges=edges_seed_neartip, minSize=1.5*dl, maxSize=el_size) 
+		edges_seed_nearsurf2 = FFModel.rootAssembly.instances['Specimen'].edges.findAt((((MyListCoord[1][0]+MyListCoord[2][0])/2.0, (MyListCoord[1][1]+MyListCoord[2][1])/2.0, 0.0), ))
+		FFModel.rootAssembly.seedEdgeByBias(biasMethod=SINGLE, end1Edges=edges_seed_nearsurf2, minSize=el_size, maxSize=dl*15.0) 		
+		for t in range(2,(len(MyListCoord)-2),1):
+			edges_temp_coarse = FFModel.rootAssembly.instances['Specimen'].edges.findAt((((MyListCoord[t][0]+MyListCoord[t+1][0])/2.0, (MyListCoord[t][1]+MyListCoord[t+1][1])/2.0, 0.0), ))
+			FFModel.rootAssembly.seedEdgeBySize(edges=edges_temp_coarse,size=dl*15.0,constraint=FIXED)
+	Crack_Edge = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((Xc + Radius_1*cos(HorizontalAngle), Yc + Radius_1*sin(HorizontalAngle), 0.0), ))
+	FFModel.rootAssembly.seedEdgeBySize(edges=Crack_Edge,size=1.5*dl,constraint=FIXED)
+	partInstances =(FFModel.rootAssembly.instances['Specimen'],)
+	FFModel.rootAssembly.generateMesh(regions=partInstances)
+	
+	
+	#Pad mesh sizes - Seeding edges (define element size at edges and at internal partition of pad) 
+	Cont2Edge = Pad.edges.findAt(((0.0, 0.0, 0.0), ))
+	Pad.seedEdgeBySize(edges=Cont2Edge, size=el_size, deviationFactor=0.5, constraint=FINER)
+	TopPadEdge = Pad.edges.findAt(((0.0, y_pad + Pad_h, 0.0), ))
+	Pad.seedEdgeBySize(edges=TopPadEdge, size=0.75, constraint=FINER)
+	LPEdge = Pad.edges.findAt(((-Pad_w/2.0, (y_pad + Pad_h)/2.0, 0.0), ))
+	Pad.seedEdgeBySize(edges=LPEdge, size=0.75, constraint=FINER)
+	RPEdge = Pad.edges.findAt(((Pad_w/2.0, (y_pad + Pad_h)/2.0, 0.0), ))
+	Pad.seedEdgeBySize(edges=RPEdge, size=0.75, constraint=FINER)
+	yM = Pad_R - ((Pad_R)**2 - (0.90*(Pad_w/2.0))**2)**(0.5)
+	LLPEdges = Pad.edges.findAt((( 0.90*(-Pad_w/2.0), yM, 0.0), ))
+	Pad.seedEdgeByBias(biasMethod=SINGLE, end1Edges=LLPEdges, minSize=4 * el_size, maxSize=0.75)
+	RLPEdges = Pad.edges.findAt((( 0.90*(Pad_w/2.0), yM, 0.0), ))
+	Pad.seedEdgeByBias(biasMethod=SINGLE, end2Edges=RLPEdges, minSize=4 * el_size, maxSize=0.75)
+	Part1PEd = Pad.edges.findAt(((-1.50 * Dis, y+1.50 * Dis/8.0, 0.0), ))
+	Part2PEd = Pad.edges.findAt(((1.50 * Dis, y+1.50 * Dis/8.0, 0.0), ))
+	Pad.seedEdgeByBias(biasMethod=SINGLE, end1Edges=Part1PEd, end2Edges=Part2PEd, minSize=el_size, maxSize=20.0*el_size)
+	Part3PEd = Pad.edges.findAt(((0.0, y+1.50 * Dis/2.0, 0.0), ))
+	Pad.seedEdgeBySize(edges=Part3PEd, size=20.0*el_size, deviationFactor=0.15)
+	Pad.generateMesh()
+	
+
+	#----------------STEPS-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+	#Define first analysis step (for each analysis step there will be a loading condition) and output variables.
+	FFModel.StaticStep(name='Step-1', previous='Initial', initialInc=0.005, maxInc=0.1, maxNumInc=10000, minInc=1e-012, nlgeom=ON)
+	FFModel.FieldOutputRequest(name='F-Output-1', createStepName='Step-1', 
+		variables=('CDISP','CF','CSTRESS','LE','PE','PEEQ','PEMAG','RF','S','U', 'COORD') )
+		
+	#Define remaining analysis steps
+	for m in range(2,4,1):
+		stepName1 = 'Step-'+str(m-1)
+		stepName2 = 'Step-'+str(m)
+		HOUT  = 'F-Output-'+str(m)
+		H_SIF = 'SIF'+str(m)
+		FFModel.StaticStep(name=stepName2, previous=stepName1, initialInc=0.005, maxInc=0.015, maxNumInc=10000, minInc=1e-012, nlgeom=ON)
+		FFModel.FieldOutputRequest(name=HOUT, createStepName=stepName2, 
+			variables=('CDISP','CF','CSTRESS','LE','PE','PEEQ','PEMAG','RF','S','U', 'COORD') )
+		FFModel.HistoryOutputRequest(name=H_SIF, createStepName=stepName2, contourIntegral='Crack-1', sectionPoints=DEFAULT,
+			rebar=EXCLUDE, numberOfContours=ContNumber, contourType=K_FACTORS)
+		#FFModel.steps[stepName2].control.setValues( allowPropagation=OFF, resetDefaultValues=OFF,
+		#	discontinuous=ON, timeIncrementation=(8.0, 10.0, 9.0, 16.0, 10.0, 4.0, 12.0, 10.0, 6.0, 3.0, 50.0))
+
+	
+	#--------------CONTACT DEFINITION-----------------------------------------------------------------------------------------------------------------------------------------------
+	#Define contact properties: formulation (lagrange multipliers, coefficient of friction, isotropic material)
+	FFModel.ContactProperty('Contact_Interface')
+	FFModel.interactionProperties['Contact_Interface'].TangentialBehavior(formulation=LAGRANGE, directionality=ISOTROPIC, slipRateDependency=OFF, 
+		pressureDependency=OFF, temperatureDependency=OFF, dependencies=0, table=((COF, ), ), shearStressLimit=None)
+	
+	#Define master and slave surfaces for contact interaction.
+	MasterEdge = FFModel.rootAssembly.instances['Pad'].edges.findAt(( (0.0, 0.0, 0.0), ))	
+	MasterRegion= FFModel.rootAssembly.Surface(side1Edges = MasterEdge, name ='Master')
+	SlaveEdge = FFModel.rootAssembly.instances['Specimen'].edges.findAt(( (0.0, 0.0, 0.0), ), ( (1.05*X0, 0.0, 0.0), ))
+	SlaveRegion= FFModel.rootAssembly.Surface(side1Edges = SlaveEdge, name ='Slave')
+	FFModel.SurfaceToSurfaceContactStd(name='Contact', createStepName='Step-1', master=MasterRegion, slave=SlaveRegion, sliding=FINITE, 
+		thickness=ON, interactionProperty='Contact_Interface', adjustMethod=NONE, initialClearance=OMIT, datumAxis=None, clearanceRegion=None)
+	
+	#---------------------MPC CONSTRAINT -----------------------------------------------------------------------------------------------------------------------------------------------
+	#Create reference pont at top of pad (will be used to apply normal load P)
+	Point = FFModel.rootAssembly.ReferencePoint(point=(0.0, y_pad + Pad_h, 0.0))
+	r1_ID = Point.id
+	r1 = FFModel.rootAssembly.referencePoints
+	refPoints1=(r1[r1_ID], )
+	MPCpointSet=FFModel.rootAssembly.Set(referencePoints=refPoints1, name='MPC_point')
+	
+	#Define MPC constrain (tie the DOFs of nodes at top surface of pad to the reference point): avoid rotation due to concentrated load P 
+	MPCEdge = FFModel.rootAssembly.instances['Pad'].edges.findAt(( (0.0, y_pad + Pad_h, 0.0), ))
+	MPCEdgeSet=FFModel.rootAssembly.Set(edges=MPCEdge, name='MPC_edge')
+	FFModel.MultipointConstraint(name='MPC_Constraint', controlPoint=MPCpointSet, surface=MPCEdgeSet, mpcType=TIE_MPC, userMode=DOF_MODE_MPC, userType=0, csys=None)
+	
+	#--------------------------- LOAD -----------------------------------------------------------------------------------------------------------------------------------------------		
+	#Define Normal load P - first loading step (Step 1)
+	FFModel.ConcentratedForce(name='Normal_Load', createStepName='Step-1', region=MPCpointSet, cf2=-P, distributionType=UNIFORM, field='', localCsys=None)	
+	
+	#Define cyclic loading - Maximum and minimum (axial and reaction) loadings (Step 2 and Step 3, respectively)
+	RightSideSpe = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((Spe_L/2.0, -Spe_h/2.0, 0.0), ))
+	RSSpe = FFModel.rootAssembly.Surface(side1Edges = RightSideSpe, name ='RightSideSpe')
+	LeftSideSpe = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((-Spe_L/2.0, -Spe_h/2.0, 0.0), ))
+	LSSpe = FFModel.rootAssembly.Surface(side1Edges = LeftSideSpe, name ='LeftSideSpe')
+	FFModel.Pressure(name='Axial', createStepName='Step-2', region=RSSpe, distributionType=UNIFORM, field='', magnitude=-Saxial[0], amplitude=UNSET)
+	FFModel.Pressure(name='Reaction', createStepName='Step-2', region=LSSpe, distributionType=UNIFORM, field='', magnitude=-Sreaction[0], amplitude=UNSET)
+	for n in range(3,4,1):
+		stepName = 'Step-'+str(n)
+		FFModel.loads['Axial'].setValuesInStep(stepName=stepName, magnitude=-Saxial[n-2])
+		FFModel.loads['Reaction'].setValuesInStep(stepName=stepName, magnitude=-Sreaction[n-2])
+	
+	#-------------------------------------- BOUNDARY CONDITIONS ---------------------------------------------------------------------------------------------------------------------	
+	#Boundary conditions at Bottom of specimen - Symmetry line at center line of the specimen.
+	BotSpe = FFModel.rootAssembly.instances['Specimen'].edges.findAt(((0.0, -Spe_h, 0.0), ))
+	BSpe = FFModel.rootAssembly.Set(edges = BotSpe, name ='BotSpe')
+	FFModel.DisplacementBC(name='Sym', createStepName='Initial', region=BSpe, u1=UNSET, u2=SET, ur3=UNSET, amplitude=UNSET, 
+		distributionType=UNIFORM, fieldName='', localCsys=None)
+		
+	#Boundary conditions at Left and Right sides of pad - (no displacement in the x direction).
+	RightSidePad = FFModel.rootAssembly.instances['Pad'].edges.findAt(((Pad_w/2.0, (y_pad + Pad_h)/2.0, 0.0), ))
+	RSPad = FFModel.rootAssembly.Set(edges = RightSidePad, name ='RightSidePad')
+	LeftSidePad = FFModel.rootAssembly.instances['Pad'].edges.findAt(((-Pad_w/2.0, (y_pad + Pad_h)/2.0, 0.0), ))
+	LSPad = FFModel.rootAssembly.Set(edges = LeftSidePad, name ='LeftSidePad')
+	FFModel.DisplacementBC(name='LeftSidePad', createStepName='Initial', region=LSPad, u1=SET, u2=UNSET, ur3=UNSET, amplitude=UNSET, 
+		distributionType=UNIFORM, fieldName='', localCsys=None)
+	FFModel.DisplacementBC(name='RightSidePad', createStepName='Initial', region=RSPad, u1=SET, u2=UNSET, ur3=UNSET, amplitude=UNSET, 
+		distributionType=UNIFORM, fieldName='', localCsys=None)	
+	
+	
+	
+	#-------------------------------CRACK FACES DEFINITION-----------------------------------------------------------------------------------------------------------
+	#Create set of nodes with repeated coordinates (store each group in different arrays for each crack face)
+	rb = 1e-6
+	fca = FFModel.rootAssembly.instances['Specimen'].nodes
+	node_Label = [[a.label, a.coordinates, a] for a in fca]
+	Cracksurf1 = []
+	Cracksurf2 = []
+	CrackSurf1_nodes = []			#set with nodes that belong to crack face 1
+	CrackSurf2_nodes = []			#set with nodes that belong to crack face 2
+	tip = [] 						#set with crack tip node
+	for i in range(len(node_Label)):
+		if (((node_Label[i][1][0] - Xc)**2.0 + (node_Label[i][1][1] - Yc)**2.0) <=rb**2.0):
+			tip.append(node_Label[i][2])
+			CrackSurf1_nodes.append(node_Label[i][0])
+			CrackSurf2_nodes.append(node_Label[i][0])
+		for a in range(i+1,len(node_Label),1):
+			if node_Label[i][1]==node_Label[a][1]: 
+				Cracksurf1.append(node_Label[a][2])
+				CrackSurf1_nodes.append(node_Label[a][0])
+				Cracksurf2.append(node_Label[i][2])
+				CrackSurf2_nodes.append(node_Label[i][0])
+			else: pass
+			
+	#Create set of elements (label and element object) that have nodes belonging to crack face 1		
+	el_label=[]	
+	el_CrackSurf1=[]		
+	for ky in range(len(Cracksurf1)):
+		a = [[aba.label, aba] for aba in Cracksurf1[ky].getElements()]
+		el_CrackSurf1.extend(a)		
+		b = [bb.label for bb in Cracksurf1[ky].getElements()]
+		el_label.extend(b)		
+	el_label1 = list(set(el_label))		
+	
+	#Eliminate dupplicate elements belonging to crack face 1	
+	seen = []
+	el_Surf1 = []
+	for e in range(len(el_CrackSurf1)):
+		if (el_CrackSurf1[e][0] in el_label1) and (el_CrackSurf1[e][0] not in seen):
+			seen.append(el_CrackSurf1[e][0] )
+			el_Surf1.append(el_CrackSurf1[e][1])		
+
+	#For each element belonging to crack face 1, select the face number that macthes with the crack face 1			
+	el_index = []
+	for gu in el_Surf1:
+			faces = gu.getElemEdges()
+			for index in range(len(faces)):
+				dd = list(faces[index].getNodes())
+				dd_label = [ddd.label for ddd in dd]
+				if (dd_label[0] in CrackSurf1_nodes) and (dd_label[1] in CrackSurf1_nodes): el_index.append([index, gu.label])
+
+	#Separate element faces according to its numbering	(1 for face1, 2 for face2, 3 for face3 and 4 for face4)				
+	nel1 = []
+	el2 = []
+	el3 = []
+	el4 = []	
+	for ind in range(len(el_index)):
+		if el_index[ind][0] == 1: el2.append(el_index[ind][1])
+		elif el_index[ind][0] == 0: nel1.append(el_index[ind][1])
+		elif el_index[ind][0] == 2: el3.append(el_index[ind][1])
+		elif el_index[ind][0] == 3: el4.append(el_index[ind][1])	
+	el1=[i for i in nel1 if ((i not in el2) and (i not in el4))]		
+		
+	#create element faces set base on its numbering and create element surface based (CrackFace1) on the element faces set			
+	el_set1 = FFModel.rootAssembly.SetFromElementLabels(name='my-set2', elementLabels=(('Specimen', tuple(el1)),))
+	el_set2 = FFModel.rootAssembly.SetFromElementLabels(name='my-set3', elementLabels=(('Specimen', tuple(el2)),))
+	el_set3 = FFModel.rootAssembly.SetFromElementLabels(name='my-set4', elementLabels=(('Specimen', tuple(el3)),))
+	el_set4 = FFModel.rootAssembly.SetFromElementLabels(name='my-set5', elementLabels=(('Specimen', tuple(el4)),))
+	if (el1 == []) and (el2 == []) and (el3 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set4, S4), ))
+	elif (el1 == []) and (el2 == []) and (el4 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set3, S3), ))
+	elif (el1 == []) and (el3 == []) and (el4 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set2, S2), ))
+	elif (el2 == []) and (el3 == []) and (el4 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set1, S1), ))
+	elif (el1 == []) and (el2 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set3, S3), (el_set4, S4) ))
+	elif (el1 == []) and (el3 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set2, S2), (el_set4, S4) ))
+	elif (el1 == []) and (el4 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set3, S3), (el_set2, S2) ))
+	elif (el2 == []) and (el3 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set1, S1), (el_set4, S4) ))
+	elif (el2 == []) and (el4 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set1, S1), (el_set3, S3) ))
+	elif (el3 == []) and (el4 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set1, S1), (el_set2, S2) ))
+	elif el4 == []: FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set1, S1), (el_set2, S2), (el_set3, S3), ))
+	elif el3 == []: FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set1, S1), (el_set2, S2), (el_set4, S4), ))
+	elif el2 == []: FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set1, S1), (el_set3, S3), (el_set4, S4), ))
+	elif el1 == []: FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set2, S2), (el_set3, S3), (el_set4, S4), ))
+	else: FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace1', elementSetSeq=((el_set1, S1), (el_set2, S2), (el_set3, S3), (el_set4, S4)))
+	
+	#Repeat for crack face 2: Create set of elements (label and element object) that have nodes belonging to crack face 2	
+	el_label2=[]	
+	el_CrackSurf2=[]		
+	for ky in range(len(Cracksurf2)):
+		for abaa in Cracksurf2[ky].getElements():
+			el_CrackSurf2.append([abaa.label, abaa])
+			el_label2.extend([abaa.label])		
+	el_label12 = list(set(el_label2))		
+	
+	#Repeat for crack face 2: Eliminate dupplicate elements belonging to crack face 2	
+	seen2 = []
+	el_Surf2 = []
+	for e in range(len(el_CrackSurf2)):
+		if (el_CrackSurf2[e][0] in el_label12) and (el_CrackSurf2[e][0] not in seen2):
+			seen2.append(el_CrackSurf2[e][0] )
+			el_Surf2.append(el_CrackSurf2[e][1])		
+
+	#Repeat for crack face 2: For each element belonging to crack face 1, select the face number that macthes with the crack face 2					
+	el_index2 = []
+	for guu in el_Surf2:
+			faces2 = guu.getElemEdges()
+			for indexx in range(len(faces2)):
+				dd2 = list(faces2[indexx].getNodes())
+				dd2_label = [ddd2.label for ddd2 in dd2]
+				if (dd2_label[0] in CrackSurf2_nodes) and (dd2_label[1] in CrackSurf2_nodes): el_index2.append([indexx, guu.label])
+
+	#Repeat for crack face 2: Separate element faces according to its numbering	(1 for face1, 2 for face2, 3 for face3 and 4 for face4)					
+	ne1 = []
+	e2 = []
+	e3 = []
+	e4 = []	
+	for ind in range(len(el_index2)):
+		if el_index2[ind][0] == 0: ne1.append(el_index2[ind][1])
+		elif el_index2[ind][0] == 1: e2.append(el_index2[ind][1])
+		elif el_index2[ind][0] == 2: e3.append(el_index2[ind][1])
+		else: e4.append(el_index2[ind][1])
+	e1=[i for i in ne1 if ((i not in e2) and (i not in e4))]	
+	
+	#create element faces set base on its numbering and create element surface based (CrackFace2) on the element faces set				
+	e_set1 = FFModel.rootAssembly.SetFromElementLabels(name='my2-set2', elementLabels=(('Specimen', tuple(e1)),))
+	e_set2 = FFModel.rootAssembly.SetFromElementLabels(name='my2-set3', elementLabels=(('Specimen', tuple(e2)),))
+	e_set3 = FFModel.rootAssembly.SetFromElementLabels(name='my2-set4', elementLabels=(('Specimen', tuple(e3)),))
+	e_set4 = FFModel.rootAssembly.SetFromElementLabels(name='my2-set5', elementLabels=(('Specimen', tuple(e4)),))
+	if (e1 == []) and (e2 == []) and (e3 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set4, S4), ))
+	elif (e1 == []) and (e2 == []) and (e4 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set3, S3), ))
+	elif (e1 == []) and (e3 == []) and (e4 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set2, S2), ))
+	elif (e2 == []) and (e3 == []) and (e4 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set1, S1), ))
+	elif (e1 == []) and (e2 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set3, S3), (e_set4, S4) ))
+	elif (e1 == []) and (e3 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set2, S2), (e_set4, S4) ))
+	elif (e1 == []) and (e4 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set3, S3), (e_set2, S2) ))
+	elif (e2 == []) and (e3 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set1, S1), (e_set4, S4) ))
+	elif (e2 == []) and (e4 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set1, S1), (e_set3, S3) ))
+	elif (e3 == []) and (e4 == []): FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set1, S1), (e_set2, S2) ))
+	elif e4 == []: FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set1, S1), (e_set2, S2), (e_set3, S3), ))
+	elif e3 == []: FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set1, S1), (e_set2, S2), (e_set4, S4), ))
+	elif e2 == []: FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set1, S1), (e_set3, S3), (e_set4, S4), ))
+	elif e1 == []: FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set2, S2), (e_set3, S3), (e_set4, S4), ))
+	else: FFModel.rootAssembly.SurfaceFromElsets(name='CrackFace2', elementSetSeq=((e_set1, S1), (e_set2, S2), (e_set3, S3), (e_set4, S4)))
+
+	#Node set for each crack face, used for path integral adjustment
+	nodesCrackSurf1 = [[c.coordinates[1], c.label] for c in Cracksurf1]
+	nodesLabelSurf1 = np.asarray(sorted(nodesCrackSurf1))[:,1]
+	nodesPath1 = tuple(nodesLabelSurf1.astype(int))
+
+	nodesCrackSurf2 = [[c.coordinates[1], c.label] for c in Cracksurf2]
+	nodesLabelSurf2 = np.asarray(sorted(nodesCrackSurf2))[:,1]
+	nodesPath2 = tuple(nodesLabelSurf2.astype(int))
+	
+	#-------------------------------CRACK FACE CONTACT DEFINITION -----------------------------------------------------------------------------------------------------------
+	FFModel.ContactProperty('CrackFaceInter')
+	FFModel.interactionProperties['CrackFaceInter'].TangentialBehavior(
+	    formulation=PENALTY, directionality=ISOTROPIC, slipRateDependency=OFF, 
+	    pressureDependency=OFF, temperatureDependency=OFF, dependencies=0, 
+	    table=((CrackFric, ), ), shearStressLimit=None, maximumElasticSlip=FRACTION, 
+	    fraction=PenaltyStiffness, elasticSlipStiffness=None)
+	#FFModel.interactionProperties['CrackFaceInter'].TangentialBehavior(
+	#	formulation=FRICTIONLESS)
+	FFModel.interactionProperties['CrackFaceInter'].NormalBehavior(
+	    pressureOverclosure=HARD, allowSeparation=ON, 
+	    constraintEnforcementMethod=DEFAULT)
+	
+	
+	FFModel.ContactStd(name='CrackFaceCont', 
+		createStepName='Initial')
+	r11=FFModel.rootAssembly.surfaces['CrackFace1']
+	r12=FFModel.rootAssembly.surfaces['CrackFace2']
+	FFModel.interactions['CrackFaceCont'].includedPairs.setValuesInStep(
+		stepName='Initial', useAllstar=OFF, addPairs=((r11, r12), ))
+	FFModel.interactions['CrackFaceCont'].contactPropertyAssignments.appendInStep(
+		stepName='Initial', assignments=((GLOBAL, SELF, 'CrackFaceInter'), ))
+	
+	#Create and submit job	
+	mdb.Job(name=jobName, model=ModelName, description='Fretting Fatigue Model',  memory=50, numCpus=3, numDomains=3)
+	mdb.jobs[jobName].submit()
+	mdb.jobs[jobName].waitForCompletion()
+		
+	#---------------------------------------------------------------------------------
+	# CALCULATING AVERAGE SIFs AND DEFINING PROPAGATION ANGLE
+	#---------------------------------------------------------------------------------
+	#Acess odb files and outputs from simulation
+	odbName = jobName+'.odb'
+	ODB = odbAccess.openOdb(path = odbName, readOnly=False)
+	odb = session.odbs[odbName]
+	session.viewports['Viewport: 1'].setValues(displayedObject=odb)
+   
+	#Define node paths at crack faces 
+	CrackFacePath1 = session.Path(name='CrackFacePath1', type=NODE_LIST,expression=(('SPECIMEN', nodesPath1 )))
+	CrackFacePath2 = session.Path(name='CrackFacePath2', type=NODE_LIST,expression=(('SPECIMEN', nodesPath2 )))
+	
+	#Numerical derivatives of auxiliary fields for adjustment of interaction integral, accounting for the effect of crack face stresses 
+	nodesRcoordCrackface1 = [[((c.coordinates[0]-Xc)**2.0 + (c.coordinates[1]-Yc)**2.0)**0.5, c.label] for c in Cracksurf1]
+	faceS_ = np.asarray(sorted(nodesRcoordCrackface1))[:,0]
+	faceS_aux2 = faceS_ + dx
+	faceS_aux3 = faceS_ - dx
+	Face1_u1_2a_dx = ((1.0+nu)/E)*np.sqrt(faceS_aux2/(2.0*pi))*sin(-pi/2.0)*(kapa +2.0+ cos(-pi))
+	Face1_u1_2a_1dx = ((1.0+nu)/E)*np.sqrt(faceS_aux3/(2.0*pi))*sin(-pi/2.0)*(kapa +2.0+ cos(-pi))
+	Face1_deriv2a_u1_x1 = (Face1_u1_2a_dx - Face1_u1_2a_1dx)/(2.0*dx)
+	Face1_u2_2a_dx = ((1.0+nu)/E)*np.sqrt(faceS_aux2/(2.0*pi))*sin(-pi/2.0)*(kapa - cos(-pi))
+	Face1_u2_2a_1dx = ((1.0+nu)/E)*np.sqrt(faceS_aux3/(2.0*pi))*sin(-pi/2.0)*(kapa - cos(-pi))
+	Face1_deriv2a_u2_x1 = (Face1_u2_2a_dx - Face1_u2_2a_1dx)/(2.0*dx)
+	dlface1_temp = [0]
+	dlface1_temp.extend(faceS_[:-1])
+	dlface1 = faceS_ - dlface1_temp
+	
+	nodesRcoordCrackface2 = [[((c.coordinates[0]-Xc)**2.0 + (c.coordinates[1]-Yc)**2.0)**0.5, c.label] for c in Cracksurf2]
+	faceS = np.asarray(sorted(nodesRcoordCrackface2))[:,0]
+	faceSaux2 = faceS_ + dx
+	faceSaux3 = faceS_ - dx
+	Face2_u1_2a_dx = ((1.0+nu)/E)*np.sqrt(faceSaux2/(2.0*pi))*sin(-pi/2.0)*(kapa +2.0+ cos(-pi))
+	Face2_u1_2a_1dx = ((1.0+nu)/E)*np.sqrt(faceSaux3/(2.0*pi))*sin(-pi/2.0)*(kapa +2.0+ cos(-pi))
+	Face2_deriv2a_u1_x1 = (Face2_u1_2a_dx - Face2_u1_2a_1dx)/(2.0*dx)
+	Face2_u2_2a_dx = ((1.0+nu)/E)*np.sqrt(faceSaux2/(2.0*pi))*sin(-pi/2.0)*(kapa - cos(-pi))
+	Face2_u2_2a_1dx = ((1.0+nu)/E)*np.sqrt(faceSaux3/(2.0*pi))*sin(-pi/2.0)*(kapa - cos(-pi))
+	Face2_deriv2a_u2_x1 = (Face2_u2_2a_dx - Face2_u2_2a_1dx)/(2.0*dx)
+	dlface2_temp = [0]
+	dlface2_temp.extend(faceS[:-1])
+	dlface2 = faceS - dlface2_temp
+	
+	
+	#crack face stresses (contact pressure and contact shear) for each increment of analysis from maximum load to minimum load
+	Step_name = 'Step-3'
+	Frame = odb.steps[Step_name].frames
+	CPRESS_FACE1 = []
+	CSHEAR_FACE1 = []
+	CPRESS_FACE2 = []
+	CSHEAR_FACE2 = []
+	for l in range(0, len(Frame), 1):
+		frameAc = odb.steps[Step_name].frames[l]
+		xyBotName = 'CPRESSface1'+str(l)
+		xyTopName = 'CPRESSface2'+str(l)
+		xyBot1Name = 'CSHEARface1'+str(l)
+		xyTop1Name = 'CSHEARface2'+str(l)
+		session.viewports['Viewport: 1'].odbDisplay.setFrame(frameAc)
+		session.viewports['Viewport: 1'].odbDisplay.setPrimaryVariable(
+			variableLabel='CPRESS', outputPosition=ELEMENT_NODAL)
+		CPRESSface1 = session.XYDataFromPath(name= xyBotName, path=CrackFacePath1, includeIntersections=False, 
+			pathStyle=PATH_POINTS, numIntervals=10, shape=UNDEFORMED, labelType=TRUE_DISTANCE_X) 
+		CPRESSface2 = session.XYDataFromPath(name= xyTopName, path=CrackFacePath2, includeIntersections=False, 
+			pathStyle=PATH_POINTS, numIntervals=10, shape=UNDEFORMED, labelType=TRUE_DISTANCE_X) 
+		session.viewports['Viewport: 1'].odbDisplay.setFrame(frameAc)
+		session.viewports['Viewport: 1'].odbDisplay.setPrimaryVariable(
+			variableLabel='CSHEAR1', outputPosition=ELEMENT_NODAL)
+		CSHEARface1 = session.XYDataFromPath(name= xyBot1Name, path=CrackFacePath1, includeIntersections=False, 
+			pathStyle=PATH_POINTS, numIntervals=10, shape=UNDEFORMED, labelType=TRUE_DISTANCE_X) 
+		CSHEARface2 = session.XYDataFromPath(name= xyTop1Name, path=CrackFacePath2, includeIntersections=False, 
+			pathStyle=PATH_POINTS, numIntervals=10, shape=UNDEFORMED, labelType=TRUE_DISTANCE_X) 
+		CPRESS_FACE1.append(CPRESSface1)
+		CSHEAR_FACE1.append(CSHEARface1)
+		CPRESS_FACE2.append(CPRESSface2)
+		CSHEAR_FACE2.append(CSHEARface2)		
+	cpressureFace1 = np.asarray(CPRESS_FACE1) # convert lists to array, [] to ([])
+	cpressureFace2 = np.asarray(CPRESS_FACE2)	
+	cshearFace1 = np.asarray(CSHEAR_FACE1)		
+	cshearFace2 = np.asarray(CSHEAR_FACE2)
+	print(cpressureFace1)
+	#Adjustment of interaction integral considering crack face stresses
+	KI = []
+	KII = []
+	increment = []
+	for C1 in Contours:
+		# KI (ModeI stress stress intensity factor)  
+		KIC1 = 'Stress intensity factor K1: K1 at SIF3_CRACK-1_CRACKTIPSET_Contour_'+str(C1)+' in ELSET  ALL ELEMENTS'
+		# KII (ModeII stress stress intensity factor)
+		KIIC1 = 'Stress intensity factor K2: K2 at SIF3_CRACK-1_CRACKTIPSET_Contour_'+str(C1)+' in ELSET  ALL ELEMENTS'
+		xy3 = session.XYDataFromHistory(name='KI_C1', odb=odb, outputVariableName=KIC1, )
+		KIA = session.XYData(name='KI', objectToCopy=xy3, sourceDescription='KIC1')
+		xy2 = session.XYDataFromHistory(name='KII_C1', odb=odb, outputVariableName=KIIC1, )
+		KIIA = session.XYData(name='KII', objectToCopy=xy2, sourceDescription='KIIC1')
+		ki = np.asarray(KIA)[:,1]
+		increment = np.asarray(KIA)[:,0]
+		kii = np.asarray(KIIA)[:,1]
+		ki_aux = []
+    	kii_aux = []
+	print(len(ki))
+    	for i_aux in range(0,len(ki),1):
+    		CPface1 = cpressureFace1[i_aux,:C1,1]
+    		CPface2 = cpressureFace2[i_aux,:C1,1]
+    		CSface1 = cshearFace1[i_aux,:C1,1]
+    		CSface2 = cshearFace2[i_aux,:C1,1]		
+    		#Madjust2 = sum((-CSface2-CSface1)*deriv2a_u1_x1[:C1]*dl)
+    		Madjust2 = sum(-CSface1*np.asarray(Face1_deriv2a_u1_x1[:C1])*np.asarray(dlface1[:C1]) - CSface2*np.asarray(Face2_deriv2a_u1_x1[:C1])*np.asarray(dlface2[:C1]))
+    		M22 = kii[i_aux]*2.0*(1.0-nu*nu)/E
+    		M22new = M22  - Madjust2
+    		K2new = M22new*E/(2.0*(1.0-nu*nu))
+    		#Madjust1 = sum((+CPface2+CPface1)*deriv2a_u2_x1[:C1]*dl)
+    		Madjust1 = sum(+CPface1*np.asarray(Face1_deriv2a_u2_x1[:C1])*np.asarray(dlface1[:C1]) +CPface2*np.asarray(Face2_deriv2a_u2_x1[:C1])*np.asarray(dlface2[:C1]))
+    		M12 = ki[i_aux]*2.0*(1.0-nu*nu)/E
+    		M12new = M12  - Madjust1
+    		K1new = M12new*E/(2.0*(1.0-nu*nu))	
+    		ki_aux.append(K1new)
+    		kii_aux.append(K2new)			
+    	KI.append(ki_aux)
+    	KII.append(kii_aux)
+
+	#Average of K factor for each time increment of analysis from maximum load to minimum load
+	K_i = np.mean(KI, axis=0)
+	K_ii = np.mean(KII, axis=0)
+	#K_i = np.asarray([K_i1[0], K_i1[-1]])
+	#K_ii = np.asarray([K_ii1[0], K_ii1[-1]])
+	
+	#Extrapolation of K factors as function of theta and time
+	Theta_aux = np.arange(-90.0,90.0,0.25)
+	m = Theta_aux/180.0
+	m1 = np.power((1.0-m)/(1.0+m),m/2.0)
+	L = np.log((1.0-m)/(1.0+m)) - 2.0*(m/(1.0-np.power(m,2)))
+	K11_theta = m1*(np.cos(Theta_aux*pi/180.0) - (1.0/(2.0*pi))*np.sin(L*Theta_aux*pi/180.0))
+	K12_theta = m1*((-3.0/2.0)*np.sin(Theta_aux*pi/180.0))
+	K21_theta = m1*((1.0/2.0)*np.sin(Theta_aux*pi/180.0))
+	K22_theta = m1*(np.cos(Theta_aux*pi/180.0) + (1.0/(2.0*pi))*np.sin(L*Theta_aux*pi/180.0))
+
+	#Calculate envelopes of maximum difference dKi, minimum dKii and maximize da/dN	
+	delta_Kii_star =[]
+	delta_Ki_star = []
+	ki_star_max =[]
+	kii_star_max =[]
+	dadNMax = []
+	for th in range(len(Theta_aux)):
+		Ki_star = K11_theta[th]*K_i + K12_theta[th]*K_ii
+		Kii_star = K21_theta[th]*K_i + K22_theta[th]*K_ii
+		ki_star_max.append([Theta_aux[th], max(Ki_star)])
+		kii_star_max.append([Theta_aux[th], max(Kii_star)])		
+		delta_Ki_star.append([Theta_aux[th], max(Ki_star)-min(Ki_star)])
+		delta_Kii_star.append([Theta_aux[th], max(Kii_star)-min(Kii_star)])
+		dadN = ((max(Ki_star)-min(Ki_star))**2.0 + (max(Kii_star)-min(Kii_star))**2.0)**0.5
+		dadNMax.append([Theta_aux[th], dadN])
+
+	#Calculate propagation direction and update angle for new increment of prapagation			
+	AngleFinalPos = np.where(np.asarray(delta_Ki_star)[:,1] == np.asarray(delta_Ki_star)[:,1].max())
+	ThetaProp = Theta_aux[AngleFinalPos[0][0]]
+	HorizontalAngle = HorizontalAngle + ThetaProp*pi/180.0
+	
+	#Life estimation based on Paris' Law				
+	DeltaKeq = ((K_i.max()-K_i.min())**2.0 + (K_ii.max()-K_ii.min())**2.0)**0.5
+	NormalizedK = DeltaKeq/Kcrit
+	dN = a_incr/(C_paris*((DeltaKeq)**m_paris))
+		
+		
+	# === Writing output data in a external text file===  
+	DK1starFile=open('DeltaK1a.txt','a')
+	DK1starFile.write(str(np.asarray(delta_Ki_star)[:,1])+'\n')
+	DK1starFile.close()
+	
+	# === Writing output data in a external text file===  
+	DK2starFile=open('DeltaK2a.txt','a')
+	DK2starFile.write(str(np.asarray(delta_Kii_star)[:,1])+'\n')
+	DK2starFile.close()
+
+	# === Writing output data in a external text file===  
+	PropAngleFile=open('Propagation.txt','a')
+	PropAngleFile.write(str(incr)+', '+str(Xc)+', '+str(Yc)+', '+str(ThetaProp)+', '+str(HorizontalAngle)+'\n')
+	PropAngleFile.close()	
+
+	# === Writing output data in a external text file===  
+	Kfactors=open('PropagationLife.txt','a')
+	Kfactors.write(str(incr)+', '+str(K_i.max())+', '+str(K_ii.max())+', '+str(K_i.max()-K_i.min())+', '+str(K_ii.max()-K_ii.min())+', '+str(DeltaKeq)+', '+str(NormalizedK)+', '+str(dN)+'\n')
+	Kfactors.close()	
+	
+	# === Closing odb files=== save disk space
+	odb = session.odbs[odbName].close()
+	# Delete former odb files
+	PATH1 = pathODB + '/FF1_' + str(incr - 2) + '.odb'
+	PATH2 = pathODB + '/FF1_' + str(incr - 2) + '.inp'
+	PATH3 = pathODB + '/FF1_' + str(incr - 2) + '.prt'
+	if incr >= 2:
+		os.remove(PATH1)
+		os.remove(PATH2)
+		os.remove(PATH3)
